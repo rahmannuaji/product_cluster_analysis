@@ -69,40 +69,95 @@ def praproses(R, jendela=4):
     return (halus - halus.mean(1, keepdims=True)) / np.where(sd == 0, 1, sd)
 
 
-# ---------- 3. DTW dengan Sakoe-Chiba band ----------
-def matriks_dtw(Z, radius=4):
-    """Matriks jarak DTW semua pasangan. Divektorkan per pasangan: 52 x (2r+1) operasi array.
-    Hasilnya identik dengan tslearn.metrics.cdist_dtw(Z, sakoe_chiba_radius=radius)."""
-    n, T = Z.shape
-    i_idx, j_idx = np.triu_indices(n, 1)
-    a, b = Z[i_idx], Z[j_idx]
-    sebelum = np.full((T, len(i_idx)), np.inf)
-    for i in range(T):
-        kini = np.full((T, len(i_idx)), np.inf)
-        for j in range(max(0, i - radius), min(T, i + radius + 1)):
-            biaya = (a[:, i] - b[:, j]) ** 2
-            if i == 0 and j == 0:
-                kini[j] = biaya
-                continue
-            terkecil = sebelum[j]
-            if j > 0:
-                terkecil = np.minimum(terkecil, np.minimum(sebelum[j - 1], kini[j - 1]))
-            kini[j] = biaya + terkecil
-        sebelum = kini
-    D = np.zeros((n, n))
-    D[i_idx, j_idx] = np.sqrt(sebelum[T - 1])
-    return D + D.T
+# ---------- 3. Jenis DTW ----------
+# Semua jenis dihitung dengan satu kernel: area warping yang diizinkan (mask) + bobot per time shift |i-j|.
+DTW_JENIS = {
+    "DTW + Sakoe-Chiba band": "Time shift dibatasi ±r minggu di sepanjang deret (Sakoe & Chiba, 1978). Default analisis.",
+    "DTW + Itakura parallelogram": "Area warping berbentuk jajaran genjang: sempit di awal/akhir deret, lebar di tengah; kemiringan maksimum s (Itakura, 1975).",
+    "DTW klasik (unconstrained)": "Time shift bebas tanpa batas; rawan pathological warping.",
+    "Derivative DTW (DDTW)": "DTW pada turunan (kemiringan) deret, sehingga yang dicocokkan adalah arah naik/turun (Keogh & Pazzani, 2001). Memakai Sakoe-Chiba band r.",
+    "Weighted DTW (WDTW)": "Tanpa batas keras; time shift besar diberi penalti logistik dengan konstanta g (Jeong dkk., 2011).",
+    "Euclidean (tanpa warping)": "Baseline: minggu ke-t hanya dibandingkan dengan minggu ke-t (setara Sakoe-Chiba r = 0).",
+}
 
 
-def jalur_dtw(a, b, radius=None):
-    """Jarak DTW dan warping path satu pasangan deret (radius None = tanpa band)."""
+def turunan(Z):
+    """Estimasi turunan Keogh & Pazzani (2001): rata-rata kemiringan kiri dan kemiringan dua langkah."""
+    d = np.empty_like(Z)
+    d[:, 1:-1] = ((Z[:, 1:-1] - Z[:, :-2]) + (Z[:, 2:] - Z[:, :-2]) / 2) / 2
+    d[:, 0], d[:, -1] = d[:, 1], d[:, -2]
+    return d
+
+
+def aturan_dtw(jenis, T=52, radius=4, slope=2.0, g=0.05):
+    """Mengembalikan (mask boolean T x T area yang diizinkan, bobot per |i-j|)."""
+    i, j = np.indices((T, T))
+    bobot = np.ones(T)
+    if jenis == "Euclidean (tanpa warping)":
+        boleh = i == j
+    elif jenis in ("DTW + Sakoe-Chiba band", "Derivative DTW (DDTW)"):
+        boleh = np.abs(i - j) <= radius
+    elif jenis == "DTW + Itakura parallelogram":
+        from tslearn.metrics import itakura_mask
+        boleh = itakura_mask(T, T, max_slope=slope).astype(bool)  # True = sel yang diizinkan
+    else:  # klasik dan WDTW: tanpa batas keras
+        boleh = np.ones((T, T), bool)
+    if jenis == "Weighted DTW (WDTW)":
+        bobot = 1 / (1 + np.exp(-g * (np.arange(T) - T / 2)))  # w_max = 1
+    return boleh, bobot
+
+
+def seri_dtw(Z, jenis):
+    return turunan(Z) if jenis == "Derivative DTW (DDTW)" else Z
+
+
+def _kernel():
+    """Kernel numba di-compile sekali saat pertama dipakai."""
+    from numba import njit, prange
+
+    @njit(parallel=True, cache=True)
+    def semua_pasangan(Z, boleh, bobot):
+        n, T = Z.shape
+        D = np.zeros((n, n))
+        for p in prange(n):
+            g = np.empty((T + 1, T + 1))
+            for q in range(p + 1, n):
+                g[:, :] = np.inf
+                g[0, 0] = 0.0
+                for i in range(1, T + 1):
+                    for j in range(1, T + 1):
+                        if boleh[i - 1, j - 1]:
+                            m = min(g[i - 1, j - 1], g[i - 1, j], g[i, j - 1])
+                            g[i, j] = bobot[abs(i - j)] * (Z[p, i - 1] - Z[q, j - 1]) ** 2 + m
+                D[p, q] = np.sqrt(g[T, T])
+                D[q, p] = D[p, q]
+        return D
+
+    return semua_pasangan
+
+
+_semua_pasangan = None
+
+
+def matriks_dtw(Z, jenis="DTW + Sakoe-Chiba band", radius=4, slope=2.0, g=0.05):
+    """Matriks jarak semua pasangan untuk jenis DTW yang dipilih.
+    Sakoe-Chiba, Itakura, dan klasik identik dengan tslearn.metrics.cdist_dtw."""
+    global _semua_pasangan
+    if _semua_pasangan is None:
+        _semua_pasangan = _kernel()
+    boleh, bobot = aturan_dtw(jenis, Z.shape[1], radius, slope, g)
+    return _semua_pasangan(np.ascontiguousarray(seri_dtw(Z, jenis)), boleh, bobot)
+
+
+def jalur_dtw(a, b, boleh, bobot):
+    """Jarak dan warping path satu pasangan deret untuk mask dan bobot tertentu."""
     T = len(a)
-    r = T if radius is None else radius
     g = np.full((T + 1, T + 1), np.inf)
     g[0, 0] = 0
     for i in range(1, T + 1):
-        for j in range(max(1, i - r), min(T, i + r) + 1):
-            g[i, j] = (a[i - 1] - b[j - 1]) ** 2 + min(g[i - 1, j - 1], g[i - 1, j], g[i, j - 1])
+        for j in range(1, T + 1):
+            if boleh[i - 1, j - 1]:
+                g[i, j] = bobot[abs(i - j)] * (a[i - 1] - b[j - 1]) ** 2 + min(g[i - 1, j - 1], g[i - 1, j], g[i, j - 1])
     jalur, i, j = [], T, T
     while i > 0 and j > 0:
         jalur.append((i - 1, j - 1))
@@ -135,11 +190,23 @@ def kmedoids(D, k, n_init=10, seed=42):
     return terbaik[1], terbaik[2]
 
 
-def kmeans_dtw(Z, k, radius=4, seed=42):
-    """K-Means dengan DTW; centroid = DTW Barycenter Averaging (Petitjean dkk., 2011)."""
+def kmeans_dtw(Z, k, dtw=None, seed=42):
+    """K-Means dengan DTW; centroid = DTW Barycenter Averaging (Petitjean dkk., 2011).
+    Untuk Euclidean memakai K-Means biasa; WDTW tidak didukung DBA."""
     from tslearn.clustering import TimeSeriesKMeans  # impor lambat: numba JIT cukup sekali
-    km = TimeSeriesKMeans(k, metric="dtw", metric_params={"sakoe_chiba_radius": radius},
-                          n_init=3, max_iter=20, random_state=seed).fit(Z[:, :, None])
+    dtw = dtw or {"jenis": "DTW + Sakoe-Chiba band", "radius": 4}
+    jenis = dtw["jenis"]
+    if jenis == "Weighted DTW (WDTW)":
+        raise ValueError("K-Means (DBA) tidak tersedia untuk Weighted DTW: DBA pada tslearn tidak mendukung bobot time shift.")
+    metric, mp = "dtw", {}
+    if jenis == "Euclidean (tanpa warping)":
+        metric = "euclidean"
+    elif jenis in ("DTW + Sakoe-Chiba band", "Derivative DTW (DDTW)"):
+        mp = {"global_constraint": "sakoe_chiba", "sakoe_chiba_radius": dtw.get("radius", 4)}
+    elif jenis == "DTW + Itakura parallelogram":
+        mp = {"global_constraint": "itakura", "itakura_max_slope": dtw.get("slope", 2.0)}
+    km = TimeSeriesKMeans(k, metric=metric, metric_params=mp or None, n_init=3, max_iter=20,
+                          random_state=seed).fit(seri_dtw(Z, jenis)[:, :, None])
     return km.labels_, km.cluster_centers_[:, :, 0]
 
 
@@ -188,12 +255,12 @@ def tinggi_potong(Zl, k):
     return float((Zl[-k, 2] + Zl[-k + 1, 2]) / 2) if k > 1 else float(Zl[-1, 2] * 1.05)
 
 
-def jalankan(D, metode, Z=None, radius=4, k=2, m=1.3, faktor_sigma=1.0, eps=4.5, min_samples=5,
+def jalankan(D, metode, Z=None, dtw=None, k=2, m=1.3, faktor_sigma=1.0, eps=4.5, min_samples=5,
              min_cluster_size=5, seed=42):
     """Mengembalikan label (0..K-1, noise = -1) dan info tambahan per metode."""
     info = {}
     if metode == "K-Means (DTW + DBA)":
-        label, info["centroid"] = kmeans_dtw(Z, k, radius, seed)
+        label, info["centroid"] = kmeans_dtw(Z, k, dtw, seed)
     elif metode == "K-Medoids":
         info["medoid"], label = kmedoids(D, k, seed=seed)
     elif metode == "Fuzzy C-Medoids":

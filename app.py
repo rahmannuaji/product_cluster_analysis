@@ -78,25 +78,30 @@ def muat():
 
 
 @st.cache_data
-def siapkan(batas_nol, jendela, radius):
+def siapkan(batas_nol, jendela):
     df = muat()
     seg = an.segmentasi(df, batas_nol)
     reg = seg[seg.segmen == "Regular"].index.values
     R = df.loc[reg, an.MINGGU].values.astype(float)
-    Z = an.praproses(R, jendela)
-    return seg, reg, R, Z, an.matriks_dtw(Z, radius)
+    return seg, reg, R, an.praproses(R, jendela)
+
+
+@st.cache_data(show_spinner=False)
+def jarak(_Z, batas_nol, jendela, dtw):
+    """dtw = tuple (key, value) dari pengaturan jenis DTW, agar bisa di-hash oleh cache."""
+    return an.matriks_dtw(_Z, **dict(dtw))
 
 
 @st.cache_data(show_spinner=False)
 def klaster(_D, _Z, kunci, metode, param):
-    label, info = an.jalankan(_D, metode, Z=_Z, radius=kunci[2], **param)
+    label, info = an.jalankan(_D, metode, Z=_Z, dtw=dict(kunci[2]), **param)
     s_rata, s_produk = an.silhouette(_D, label)
     return label, info, s_rata, s_produk
 
 
 @st.cache_data(show_spinner=False)
 def skor_k(_D, _Z, kunci, metode, param_tanpa_k):
-    return an.skor_per_k(_D, metode, Z=_Z, radius=kunci[2], **param_tanpa_k)
+    return an.skor_per_k(_D, metode, Z=_Z, dtw=dict(kunci[2]), **param_tanpa_k)
 
 
 @st.cache_data(show_spinner=False)
@@ -106,7 +111,7 @@ def robustness(_D, _Z, kunci, metode, param):
         variasi = [dict(param, faktor_sigma=f) for f in (0.5, 0.75, 1.0, 1.5, 2.0)]
     else:
         variasi = [dict(param, seed=s) for s in range(5)]
-    hasil = [an.jalankan(_D, metode, Z=_Z, radius=kunci[2], **v)[0] for v in variasi]
+    hasil = [an.jalankan(_D, metode, Z=_Z, dtw=dict(kunci[2]), **v)[0] for v in variasi]
     ari = [adjusted_rand_score(hasil[i], hasil[j]) for i in range(5) for j in range(i + 1, 5)]
     return float(np.mean(ari)), float(np.min(ari))
 
@@ -116,9 +121,23 @@ def peta_2d(_D, kunci):
     return an.mds_klasik(_D)
 
 
+@st.cache_data(show_spinner=False)
+def banding_dtw(_Z, kunci, metode, param, label_kini):
+    """Jalankan metode yang sama pada keenam jenis DTW (parameter default) untuk dibandingkan."""
+    baris = []
+    for jenis in an.DTW_JENIS:
+        Dj = jarak(_Z, kunci[0], kunci[1], tuple({"jenis": jenis, "radius": 4, "slope": 2.0, "g": 0.05}.items()))
+        lab, _ = an.jalankan(Dj, metode, Z=_Z, dtw={"jenis": jenis, "radius": 4}, **param)
+        s, _ = an.silhouette(Dj, lab)
+        ukuran_c = sorted(np.bincount(lab[lab >= 0]).tolist(), reverse=True)
+        baris.append({"Jenis DTW (default)": jenis, "Silhouette": None if s is None else round(s, 3),
+                      "Ukuran cluster": " / ".join(map(str, ukuran_c)), "ARI vs pilihan saat ini": round(adjusted_rand_score(label_kini, lab), 3)})
+    return pd.DataFrame(baris)
+
+
 # ---------- sidebar: input ----------
 PENJELASAN = {
-    "K-Means (DTW + DBA)": "Centroid-based. Centroid dihitung dengan DTW Barycenter Averaging (DBA), yaitu rata-rata yang mengikuti pasangan minggu hasil DTW. Hasil bergantung pada random seed.",
+    "K-Means (DTW + DBA)": "Centroid-based. Centroid dihitung dengan DTW Barycenter Averaging (DBA), yaitu rata-rata yang mengikuti pasangan minggu hasil DTW. Hasil bergantung pada random seed. Jika jenis jarak = Euclidean, metode ini menjadi K-Means biasa.",
     "K-Medoids": "Medoid-based. Pusat cluster adalah produk nyata (medoid) dengan total jarak DTW terkecil ke anggotanya. Bekerja langsung dari matriks DTW.",
     "Fuzzy C-Medoids": "Fuzzy clustering. Setiap produk punya membership (0–1) di semua cluster; label akhir = membership tertinggi.",
     "Spectral clustering": "Graph-based. Matriks DTW diubah menjadi similarity graph, lalu graph dipotong di bagian yang koneksinya paling lemah. Rekomendasi dari analisis (folder 03).",
@@ -131,16 +150,29 @@ PENJELASAN = {
 
 with st.sidebar:
     st.header("Pengaturan")
-    pendekatan = st.radio("1 · Clustering approach", ["Non-hierarchical", "Hierarchical"], horizontal=True,
+    jenis_dtw = st.selectbox("1 · Jenis DTW (distance)", list(an.DTW_JENIS), index=0,
+                             help="Cara mengukur kemiripan pola antarproduk. Sakoe-Chiba band r = 4 adalah default analisis.")
+    st.caption(an.DTW_JENIS[jenis_dtw])
+    dtw = {"jenis": jenis_dtw}
+    if jenis_dtw in ("DTW + Sakoe-Chiba band", "Derivative DTW (DDTW)"):
+        dtw["radius"] = st.slider("Band radius r (minggu)", 1, 8, 4, help="Time shift maksimum. 4 minggu ≈ 1 bulan.")
+    elif jenis_dtw == "DTW + Itakura parallelogram":
+        dtw["slope"] = st.select_slider("Max slope s", [1.5, 2.0, 3.0, 4.0], value=2.0,
+                                        help="Kemiringan maksimum warping path. s besar = jajaran genjang lebih lebar = time shift lebih bebas di tengah deret.")
+    elif jenis_dtw == "Weighted DTW (WDTW)":
+        dtw["g"] = st.select_slider("Penalty g", [0.01, 0.05, 0.1, 0.25, 0.5], value=0.05,
+                                    help="g kecil ≈ DTW klasik; g besar = time shift jauh makin mahal (mendekati band sempit).")
+    st.divider()
+    pendekatan = st.radio("2 · Clustering approach", ["Non-hierarchical", "Hierarchical"], horizontal=True,
                           help="Non-hierarchical: langsung membagi produk menjadi K cluster. Hierarchical: menggabungkan produk bertahap menjadi dendrogram, lalu dipotong menjadi K cluster.")
     pilihan = [m for m, (p, _) in an.METODE.items() if p == pendekatan]
     bawaan = "Spectral clustering" if pendekatan == "Non-hierarchical" else "Complete linkage"
-    metode = st.selectbox("2 · Method", pilihan, index=pilihan.index(bawaan))
+    metode = st.selectbox("3 · Method", pilihan, index=pilihan.index(bawaan))
     st.caption(PENJELASAN[metode])
 
     param = {}
     if metode in an.PAKAI_K:
-        param["k"] = st.slider("3 · Jumlah cluster (K)", 2, 6, 2)
+        param["k"] = st.slider("4 · Jumlah cluster (K)", 2, 6, 2)
     if metode == "Spectral clustering":
         param["faktor_sigma"] = st.select_slider("Kernel bandwidth σ (× median DTW distance)", [0.5, 0.75, 1.0, 1.5, 2.0], value=1.0,
                                                  help="σ besar: lebih banyak pasangan produk dianggap mirip. Label diberikan dengan cluster_qr (tanpa K-Means).")
@@ -154,18 +186,24 @@ with st.sidebar:
     if metode in an.PAKAI_SEED:
         param["seed"] = int(st.number_input("Random seed", 0, 999, 42, help="Ganti seed untuk melihat apakah hasilnya robust."))
 
-    with st.expander("Preprocessing & DTW"):
+    with st.expander("Preprocessing"):
         batas_nol = st.select_slider("Lifecycle threshold (minggu nol beruntun)", [2, 4, 8], value=4,
                                      help="Produk dengan leading/trailing zeros sepanjang ini dianggap New product / Discontinued.")
         jendela = st.select_slider("Moving average window (minggu)", [1, 2, 4, 8], value=4, help="1 = tanpa smoothing.")
-        radius = st.slider("Sakoe-Chiba band radius (minggu)", 0, 8, 4, help="0 = setara Euclidean distance (tanpa time shift).")
     st.caption("Data: Sales Transactions Dataset Weekly (Tan & Lau, 2014), 811 produk × 52 minggu.")
 
-kunci = (batas_nol, jendela, radius)
-with st.spinner("Menghitung DTW distance matrix…"):
-    seg, reg, R, Z, D = siapkan(*kunci)
-with st.spinner("Menjalankan K-Means DTW (± 30 detik pada run pertama)…" if metode.startswith("K-Means") else "Menjalankan clustering…"):
-    label_mentah, info, sil, sil_produk = klaster(D, Z, kunci, metode, param)
+kunci = (batas_nol, jendela, tuple(dtw.items()))
+seg, reg, R, Z = siapkan(batas_nol, jendela)
+with st.spinner(f"Menghitung distance matrix ({jenis_dtw})…"):
+    D = jarak(Z, *kunci)
+try:
+    with st.spinner("Menjalankan K-Means DTW (± 30 detik pada run pertama)…" if metode.startswith("K-Means") else "Menjalankan clustering…"):
+        label_mentah, info, sil, sil_produk = klaster(D, Z, kunci, metode, param)
+except ValueError as e:
+    st.error(f"{e} Pilih jenis DTW lain atau metode lain.")
+    st.stop()
+if jenis_dtw == "Derivative DTW (DDTW)":
+    info.pop("centroid", None)  # centroid DDTW berada di ruang turunan, bukan z-score
 label = an.urutkan_label(label_mentah, R)  # 1..K, 0 = noise
 klasters = sorted(set(label[label > 0]))
 wakil = an.wakil(D, label)
@@ -177,7 +215,8 @@ Zl = an.pohon(D, metode) if metode in an.HIERARKI else None
 # ---------- ringkasan ----------
 st.title("DTW clustering pola penjualan mingguan")
 teks_k = f" · K = {param['k']}" if "k" in param else ""
-catatan(f"{len(reg)} produk Regular dibandingkan bentuk polanya dengan DTW (Sakoe-Chiba band r = {radius}), setelah moving average "
+teks_dtw = jenis_dtw + "".join(f", {k} = {v}" for k, v in dtw.items() if k != "jenis")
+catatan(f"{len(reg)} produk Regular dibandingkan bentuk polanya dengan <span class='tebal'>{teks_dtw}</span>, setelah moving average "
         f"{jendela} minggu dan z-normalization. Approach: <span class='tebal'>{pendekatan}</span> · Method: "
         f"<span class='tebal'>{metode}</span>{teks_k}.")
 
@@ -330,6 +369,16 @@ if tampilan == TAMPILAN[1]:
     else:
         catatan("DBSCAN dan HDBSCAN deterministic untuk parameter yang sama; robustness dilihat dengan menggeser parameter di sidebar.")
 
+    st.markdown("**Perbandingan jenis DTW**")
+    if metode.startswith("K-Means"):
+        catatan("Perbandingan jenis DTW tidak dijalankan untuk K-Means karena butuh ± 30 detik per jenis. Pilih metode lain untuk membandingkan.")
+    elif st.checkbox("Jalankan metode ini pada keenam jenis DTW (parameter default)", value=False):
+        with st.spinner("Menghitung keenam distance matrix…"):
+            tabel = banding_dtw(Z, kunci, metode, param, label_mentah)
+        st.dataframe(tabel, hide_index=True, width="stretch")
+        catatan("ARI = 1 berarti pembagian cluster identik dengan pilihan saat ini. Silhouette setiap baris dihitung dalam ruang jaraknya "
+                "masing-masing, jadi bandingkan dengan hati-hati: jarak yang berbeda punya skala dan sebaran yang berbeda.")
+
     ka, kb = st.columns(2)
     with ka:
         st.markdown("**Silhouette per produk**")
@@ -452,45 +501,58 @@ if tampilan == TAMPILAN[2]:
 
 # ---------- tab 4: DTW explorer ----------
 if tampilan == TAMPILAN[3]:
-    catatan("DTW mencocokkan minggu secara fleksibel (time warping) agar pola yang sama tetapi bergeser tetap terbaca mirip. "
-            "Sakoe-Chiba band membatasi time shift paling jauh r minggu.")
+    catatan(f"DTW mencocokkan minggu secara fleksibel (time warping) agar pola yang sama tetapi bergeser tetap terbaca mirip. "
+            f"Jenis yang dipilih di sidebar: <span class='tebal'>{teks_dtw}</span>. {an.DTW_JENIS[jenis_dtw]}")
     pilihan_produk = list(kode)
     ka, kb = st.columns(2)
     p1 = ka.selectbox("Produk A", pilihan_produk, index=pilihan_produk.index("P1") if "P1" in pilihan_produk else 0)
     p2 = kb.selectbox("Produk B", pilihan_produk, index=pilihan_produk.index("P6") if "P6" in pilihan_produk else 1)
     a, b = Z[pilihan_produk.index(p1)], Z[pilihan_produk.index(p2)]
-    d_bebas, jalur_bebas = an.jalur_dtw(a, b)
-    d_pita, jalur_pita = an.jalur_dtw(a, b, radius)
+    boleh, bobot = an.aturan_dtw(**dtw)
+    seri = an.seri_dtw(np.vstack([a, b]), jenis_dtw)  # DDTW: turunan; lainnya: z-score apa adanya
+    d_pilih, jalur_pilih = an.jalur_dtw(seri[0], seri[1], boleh, bobot)
+    d_bebas, jalur_bebas = an.jalur_dtw(a, b, *an.aturan_dtw("DTW klasik (unconstrained)"))
     m1, m2, m3 = st.columns(3)
     m1.metric("Euclidean distance", angka(float(np.linalg.norm(a - b))))
-    m2.metric("DTW (unconstrained)", angka(d_bebas))
-    m3.metric(f"DTW (Sakoe-Chiba r = {radius})", angka(d_pita))
+    m2.metric("DTW klasik (unconstrained)", angka(d_bebas))
+    m3.metric(f"Pilihan: {jenis_dtw.split(' (')[0]}", angka(d_pilih))
 
     ka, kb = st.columns([3, 2])
     with ka:
         geser = 4.5
         fig = go.Figure()
-        for i, j in jalur_pita:
+        for i, j in jalur_pilih:
             fig.add_trace(go.Scatter(x=[i, j], y=[a[i] + geser, b[j]], mode="lines", line=dict(color="#c9c9c4", width=0.8),
                                      hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=np.arange(52), y=a + geser, name=p1, mode="lines", line=dict(color=WARNA[0], width=2.2)))
         fig.add_trace(go.Scatter(x=np.arange(52), y=b, name=p2, mode="lines", line=dict(color=WARNA[1], width=2.2)))
-        tata(fig, 380, title=dict(text=f"Week alignment (DTW, r = {radius})", font=dict(size=14)))
+        tata(fig, 380, title=dict(text=f"Week alignment ({jenis_dtw.split(' (')[0]})", font=dict(size=14)))
         fig.update_yaxes(showticklabels=False); fig.update_xaxes(title_text="Minggu ke-")
         grafik(fig)
     with kb:
         fig = go.Figure()
-        t = np.arange(52)
-        fig.add_trace(go.Scatter(x=np.r_[t, t[::-1]], y=np.r_[t - radius, (t + radius)[::-1]], fill="toself", fillcolor="rgba(42,120,214,0.10)",
-                                 line=dict(width=0), name=f"Band ±{radius}", hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=jalur_bebas[:, 0], y=jalur_bebas[:, 1], mode="lines", name="Unconstrained", line=dict(color=WARNA[1], width=2)))
-        fig.add_trace(go.Scatter(x=jalur_pita[:, 0], y=jalur_pita[:, 1], mode="lines", name="Sakoe-Chiba", line=dict(color=TINTA, width=2, dash="dot")))
+        ii, jj = np.nonzero(boleh)
+        fig.add_trace(go.Scattergl(x=ii, y=jj, mode="markers", marker=dict(size=3, color="rgba(42,120,214,0.14)", symbol="square"),
+                                   name="Area yang diizinkan", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=jalur_bebas[:, 0], y=jalur_bebas[:, 1], mode="lines", name="DTW klasik", line=dict(color=WARNA[1], width=2)))
+        fig.add_trace(go.Scatter(x=jalur_pilih[:, 0], y=jalur_pilih[:, 1], mode="lines", name="Pilihan", line=dict(color=TINTA, width=2, dash="dot")))
         tata(fig, 380, title=dict(text="Warping path", font=dict(size=14)))
-        fig.update_xaxes(title_text=f"Minggu {p1}", range=[0, 51]); fig.update_yaxes(title_text=f"Minggu {p2}", range=[0, 51])
+        fig.update_xaxes(title_text=f"Minggu {p1}", range=[-1, 52]); fig.update_yaxes(title_text=f"Minggu {p2}", range=[-1, 52])
         grafik(fig)
-    geser_maks = int(np.abs(jalur_bebas[:, 0] - jalur_bebas[:, 1]).max())
-    catatan(f"Tanpa band, DTW menggeser sampai {geser_maks} minggu untuk memaksakan kemiripan (pathological warping). "
-            f"Band r = {radius} menahan time shift itu, sehingga jaraknya berada di antara Euclidean dan DTW unconstrained.")
+    geser_bebas = int(np.abs(jalur_bebas[:, 0] - jalur_bebas[:, 1]).max())
+    geser_pilih = int(np.abs(jalur_pilih[:, 0] - jalur_pilih[:, 1]).max())
+    catatan(f"Time shift terjauh: DTW klasik {geser_bebas} minggu, pilihan Anda {geser_pilih} minggu. "
+            "Time shift yang terlalu jauh berarti DTW memaksakan kemiripan (pathological warping).")
+    if jenis_dtw == "Derivative DTW (DDTW)":
+        catatan("Pada DDTW, warping path dihitung dari turunan (kemiringan) kedua deret, sedangkan grafik kiri menampilkan z-score aslinya.")
+    if jenis_dtw == "Weighted DTW (WDTW)":
+        x = np.arange(52)
+        fig = go.Figure(go.Scatter(x=x, y=bobot, mode="lines", line=dict(color=WARNA[0], width=2),
+                                   hovertemplate="time shift %{x} minggu<br>bobot %{y:.3f}<extra></extra>"))
+        tata(fig, 260, title=dict(text=f"Bobot WDTW menurut time shift (g = {dtw['g']})", font=dict(size=14)))
+        fig.update_xaxes(title_text="|i − j| (minggu)"); fig.update_yaxes(title_text="Bobot", range=[0, 1.02])
+        grafik(fig)
+        catatan("Biaya setiap pasangan minggu dikalikan bobot ini. Pergeseran kecil murah, pergeseran besar mahal; tidak ada batas keras.")
 
 # ---------- tab 5: tabel ----------
 if tampilan == TAMPILAN[4]:
@@ -510,6 +572,9 @@ if tampilan == TAMPILAN[5]:
         ("DTW (Dynamic Time Warping)", "Jarak antar dua time series yang boleh menggeser waktu agar pola yang sama tetapi terlambat/lebih cepat tetap dinilai mirip."),
         ("Sakoe-Chiba band", "Batas time shift maksimum (r minggu) pada DTW, mencegah pathological warping."),
         ("Pathological warping", "Pencocokan minggu yang terlalu jauh, sehingga dua pola berbeda tampak mirip."),
+        ("Itakura parallelogram", "Batas warping berbentuk jajaran genjang: time shift sempit di awal/akhir deret dan lebih lebar di tengah, diatur oleh max slope s."),
+        ("Derivative DTW (DDTW)", "DTW pada turunan deret; mencocokkan arah naik/turun, bukan nilai."),
+        ("Weighted DTW (WDTW)", "DTW tanpa batas keras; time shift diberi bobot penalti logistik sehingga pergeseran jauh makin mahal (konstanta g)."),
         ("Z-normalization", "Mengubah tiap deret menjadi mean 0 dan standard deviation 1, agar yang dibandingkan adalah shape, bukan volume."),
         ("Moving average", "Smoothing: tiap minggu diganti rata-rata beberapa minggu terakhir untuk meredam fluktuasi acak."),
         ("Leading / trailing zeros", "Minggu bernilai 0 sebelum penjualan pertama / setelah penjualan terakhir (indikasi lifecycle produk)."),
