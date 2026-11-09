@@ -1,4 +1,4 @@
-"""Logika analisis: penanganan nol, praproses, DTW Sakoe-Chiba, dan enam metode klaster.
+"""Logika analisis: zero handling, preprocessing, DTW (Sakoe-Chiba band), dan metode clustering.
 
 Semua fungsi murni (tanpa Streamlit) sehingga bisa diuji di luar aplikasi.
 """
@@ -8,23 +8,29 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.sparse.csgraph import laplacian
 from scipy.spatial.distance import squareform
 from sklearn.cluster import DBSCAN, HDBSCAN, SpectralClustering
-from sklearn.metrics import silhouette_samples, silhouette_score
+from sklearn.metrics import silhouette_samples
 
 MINGGU = [f"W{i}" for i in range(52)]
 ADI_BATAS, CV2_BATAS = 1.32, 0.49  # Syntetos dkk. (2005), sesuai idclass paket R tsintermittent
 
+# metode -> (pendekatan, keluarga)
 METODE = {
-    "Spectral clustering": "graf",
-    "Fuzzy C-Medoids": "fuzzy",
-    "Complete linkage": "hierarki",
-    "Average linkage": "hierarki",
-    "DBSCAN": "kepadatan",
-    "HDBSCAN": "kepadatan",
+    "K-Means (DTW + DBA)": ("Non-hierarchical", "centroid-based"),
+    "K-Medoids": ("Non-hierarchical", "medoid-based"),
+    "Fuzzy C-Medoids": ("Non-hierarchical", "fuzzy"),
+    "Spectral clustering": ("Non-hierarchical", "graph-based"),
+    "DBSCAN": ("Non-hierarchical", "density-based"),
+    "HDBSCAN": ("Non-hierarchical", "density-based"),
+    "Complete linkage": ("Hierarchical", "agglomerative"),
+    "Average linkage": ("Hierarchical", "agglomerative"),
+    "Single linkage": ("Hierarchical", "agglomerative"),
 }
-PAKAI_K = {"Spectral clustering", "Fuzzy C-Medoids", "Complete linkage", "Average linkage"}
+PAKAI_K = {m for m in METODE if m not in ("DBSCAN", "HDBSCAN")}
+PAKAI_SEED = {"K-Means (DTW + DBA)", "K-Medoids", "Fuzzy C-Medoids"}
+HIERARKI = {m for m, (p, _) in METODE.items() if p == "Hierarchical"}
 
 
-# ---------- 1. Penanganan nilai nol ----------
+# ---------- 1. Zero handling ----------
 def adi_cv2(x):
     posisi = np.where(x > 0)[0] + 1
     if len(posisi) == 0:
@@ -36,7 +42,7 @@ def adi_cv2(x):
 
 
 def segmentasi(df, batas_nol=4):
-    """Segmen siklus hidup (nol beruntun di awal/akhir) lalu pola permintaan ADI-CV2."""
+    """Lifecycle segment (leading/trailing zeros) lalu demand pattern ADI-CV2."""
     X = df[MINGGU].values
     ada = X > 0
     awal = np.where(ada.any(1), ada.argmax(1), 52)
@@ -51,20 +57,22 @@ def segmentasi(df, batas_nol=4):
     out["segmen"] = np.select(
         [(awal >= batas_nol) & (akhir >= batas_nol), awal >= batas_nol, akhir >= batas_nol,
          out.pola.isin(["smooth", "erratic"])],
-        ["Siklus pendek", "Mulai terjual", "Berhenti terjual", "Reguler"], default="Intermiten")
+        ["Short lifecycle", "New product", "Discontinued", "Regular"], default="Intermittent")
     return out
 
 
-# ---------- 2. Praproses ----------
+# ---------- 2. Preprocessing ----------
 def praproses(R, jendela=4):
+    """Moving average lalu z-normalization per produk."""
     halus = pd.DataFrame(R).T.rolling(jendela, min_periods=1).mean().T.values
     sd = halus.std(1, keepdims=True)
     return (halus - halus.mean(1, keepdims=True)) / np.where(sd == 0, 1, sd)
 
 
-# ---------- 3. DTW dengan pita Sakoe-Chiba ----------
+# ---------- 3. DTW dengan Sakoe-Chiba band ----------
 def matriks_dtw(Z, radius=4):
-    """Matriks jarak DTW semua pasangan. Divektorkan per pasangan: 52 x (2r+1) operasi array."""
+    """Matriks jarak DTW semua pasangan. Divektorkan per pasangan: 52 x (2r+1) operasi array.
+    Hasilnya identik dengan tslearn.metrics.cdist_dtw(Z, sakoe_chiba_radius=radius)."""
     n, T = Z.shape
     i_idx, j_idx = np.triu_indices(n, 1)
     a, b = Z[i_idx], Z[j_idx]
@@ -87,7 +95,7 @@ def matriks_dtw(Z, radius=4):
 
 
 def jalur_dtw(a, b, radius=None):
-    """Jarak DTW dan jalur warping untuk satu pasangan deret (radius None = tanpa batas)."""
+    """Jarak DTW dan warping path satu pasangan deret (radius None = tanpa band)."""
     T = len(a)
     r = T if radius is None else radius
     g = np.full((T + 1, T + 1), np.inf)
@@ -103,12 +111,43 @@ def jalur_dtw(a, b, radius=None):
     return float(np.sqrt(g[T, T])), np.array(jalur[::-1])
 
 
-# ---------- 4. Metode klaster ----------
+# ---------- 4. Metode clustering ----------
+def kmedoids(D, k, n_init=10, seed=42):
+    """K-Medoids (alternating / Voronoi iteration; Kaufman & Rousseeuw, 1990)."""
+    rng = np.random.default_rng(seed)
+    terbaik = (np.inf, None, None)
+    for _ in range(n_init):
+        med = rng.choice(len(D), k, replace=False)
+        for _ in range(100):
+            label = D[:, med].argmin(1)
+            baru = med.copy()
+            for c in range(k):
+                anggota = np.where(label == c)[0]
+                if len(anggota):
+                    baru[c] = anggota[D[np.ix_(anggota, anggota)].sum(1).argmin()]
+            if np.array_equal(baru, med):
+                break
+            med = baru
+        label = D[:, med].argmin(1)
+        biaya = D[np.arange(len(D)), med[label]].sum()
+        if biaya < terbaik[0]:
+            terbaik = (biaya, med, label)
+    return terbaik[1], terbaik[2]
+
+
+def kmeans_dtw(Z, k, radius=4, seed=42):
+    """K-Means dengan DTW; centroid = DTW Barycenter Averaging (Petitjean dkk., 2011)."""
+    from tslearn.clustering import TimeSeriesKMeans  # impor lambat: numba JIT cukup sekali
+    km = TimeSeriesKMeans(k, metric="dtw", metric_params={"sakoe_chiba_radius": radius},
+                          n_init=3, max_iter=20, random_state=seed).fit(Z[:, :, None])
+    return km.labels_, km.cluster_centers_[:, :, 0]
+
+
 def fcmdd(D, k, m=1.3, n_init=10, seed=42):
     """Fuzzy C-Medoids (Krishnapuram dkk., 2001)."""
     rng = np.random.default_rng(seed)
 
-    def keanggotaan(med):
+    def membership(med):
         d = np.maximum(D[:, med], 1e-10)
         return 1 / ((d[:, :, None] / d[:, None, :]) ** (2 / (m - 1))).sum(2)
 
@@ -116,12 +155,12 @@ def fcmdd(D, k, m=1.3, n_init=10, seed=42):
     for _ in range(n_init):
         med = rng.choice(len(D), k, replace=False)
         for _ in range(100):
-            U = keanggotaan(med)
+            U = membership(med)
             baru = np.array([(D * (U[:, c] ** m)[:, None]).sum(0).argmin() for c in range(k)])
             if set(baru) == set(med):
                 break
             med = baru
-        U = keanggotaan(med)
+        U = membership(med)
         J = ((U ** m) * D[:, med]).sum()
         if J < terbaik[0]:
             terbaik = (J, med, U)
@@ -139,20 +178,34 @@ def nilai_eigen(D, faktor_sigma=1.0, banyak=8):
     return np.sort(np.linalg.eigvalsh(laplacian(A, normed=True)))[:banyak]
 
 
-def jalankan(D, metode, k=2, m=1.3, faktor_sigma=1.0, eps=4.5, min_samples=5, min_cluster_size=5, seed=42):
+def pohon(D, metode):
+    """Linkage matrix untuk hierarchical clustering (complete/average/single)."""
+    return linkage(squareform(D, checks=False), metode.split()[0].lower())
+
+
+def tinggi_potong(Zl, k):
+    """Tinggi cut pada dendrogram yang menghasilkan k cluster."""
+    return float((Zl[-k, 2] + Zl[-k + 1, 2]) / 2) if k > 1 else float(Zl[-1, 2] * 1.05)
+
+
+def jalankan(D, metode, Z=None, radius=4, k=2, m=1.3, faktor_sigma=1.0, eps=4.5, min_samples=5,
+             min_cluster_size=5, seed=42):
     """Mengembalikan label (0..K-1, noise = -1) dan info tambahan per metode."""
     info = {}
-    if metode == "Spectral clustering":
+    if metode == "K-Means (DTW + DBA)":
+        label, info["centroid"] = kmeans_dtw(Z, k, radius, seed)
+    elif metode == "K-Medoids":
+        info["medoid"], label = kmedoids(D, k, seed=seed)
+    elif metode == "Fuzzy C-Medoids":
+        info["medoid"], U = fcmdd(D, k, m=m, seed=seed)
+        label = U.argmax(1)
+        info.update(U=U, PC=float((U ** 2).sum(1).mean()))
+    elif metode == "Spectral clustering":
         A, info["sigma"] = afinitas(D, faktor_sigma)
         label = SpectralClustering(k, affinity="precomputed", assign_labels="cluster_qr",
                                    random_state=seed).fit_predict(A)
-    elif metode == "Fuzzy C-Medoids":
-        med, U = fcmdd(D, k, m=m, seed=seed)
-        label = U.argmax(1)
-        info.update(U=U, medoid=med, PC=float((U ** 2).sum(1).mean()))
-    elif metode in ("Complete linkage", "Average linkage"):
-        Zl = linkage(squareform(D, checks=False), metode.split()[0].lower())
-        label = fcluster(Zl, k, "maxclust") - 1
+    elif metode in HIERARKI:
+        label = fcluster(pohon(D, metode), k, "maxclust") - 1
     elif metode == "DBSCAN":
         label = DBSCAN(eps=eps, min_samples=min_samples, metric="precomputed").fit_predict(D)
     else:
@@ -161,7 +214,7 @@ def jalankan(D, metode, k=2, m=1.3, faktor_sigma=1.0, eps=4.5, min_samples=5, mi
 
 
 def silhouette(D, label):
-    """Silhouette tanpa noise; None bila klaster < 2."""
+    """Silhouette tanpa noise; (None, None) bila cluster < 2."""
     m = label >= 0
     if len(set(label[m])) < 2:
         return None, None
@@ -171,14 +224,14 @@ def silhouette(D, label):
 
 
 def urutkan_label(label, R):
-    """Klaster 1 = rata-rata volume terbesar, agar penomoran stabil dan mudah dibaca."""
+    """Cluster 1 = rata-rata volume terbesar, agar penomoran konsisten antarmetode."""
     sah = sorted(set(label[label >= 0]), key=lambda c: -R[label == c].mean())
     peta = {c: i + 1 for i, c in enumerate(sah)}
     return np.array([peta.get(c, 0) for c in label])  # 0 = noise
 
 
 def wakil(D, label):
-    """Produk wakil = anggota dengan total jarak DTW terkecil ke anggota lain (medoid)."""
+    """Medoid tiap cluster = anggota dengan total jarak DTW terkecil ke anggota lain."""
     hasil = {}
     for c in sorted(set(label[label > 0])):
         idx = np.where(label == c)[0]
@@ -187,7 +240,7 @@ def wakil(D, label):
 
 
 def mds_klasik(D, dim=2):
-    """Proyeksi 2D dari matriks jarak (MDS klasik); hanya alat bantu visual."""
+    """Classical MDS dari matriks jarak; hanya alat bantu visual."""
     n = len(D)
     J = np.eye(n) - 1 / n
     B = -0.5 * J @ (D ** 2) @ J
@@ -201,5 +254,5 @@ def skor_per_k(D, metode, k_list=range(2, 7), **param):
     for k in k_list:
         label, _ = jalankan(D, metode, k=k, **param)
         s, _ = silhouette(D, label)
-        baris.append({"K": k, "silhouette": s, "klaster_terkecil": int(np.bincount(label[label >= 0]).min())})
+        baris.append({"K": k, "silhouette": s, "cluster_terkecil": int(np.bincount(label[label >= 0]).min())})
     return pd.DataFrame(baris)
