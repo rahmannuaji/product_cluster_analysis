@@ -95,9 +95,8 @@ def klaster(_D, _Z, kunci, metode, param):
 
 
 @st.cache_data(show_spinner=False)
-def skor_k(_D, _Z, kunci, metode, param):
-    p = {k: v for k, v in param.items() if k != "k"}
-    return an.skor_per_k(_D, metode, Z=_Z, radius=kunci[2], **p)
+def skor_k(_D, _Z, kunci, metode, param_tanpa_k):
+    return an.skor_per_k(_D, metode, Z=_Z, radius=kunci[2], **param_tanpa_k)
 
 
 @st.cache_data(show_spinner=False)
@@ -201,10 +200,11 @@ elif ukuran.min() < 0.05 * len(reg):
 elif sil is not None and sil < 0.25:
     st.info("Silhouette < 0,25 (weak structure): batas antar-cluster tidak tegas. Baca cluster sebagai kecenderungan pola, bukan kelompok yang terpisah jelas.")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Hasil cluster", "Validasi & pilihan K", "Zero handling", "DTW explorer", "Tabel & unduh", "Glossary"])
+TAMPILAN = ["Hasil cluster", "Validasi & pilihan K", "Zero handling", "DTW explorer", "Tabel & unduh", "Glossary"]
+tampilan = st.segmented_control("Tampilan", TAMPILAN, default=TAMPILAN[0], key="tampilan", label_visibility="collapsed") or TAMPILAN[0]
 
 # ---------- tab 1: hasil ----------
-with tab1:
+if tampilan == TAMPILAN[0]:
     if Zl is not None:
         st.subheader("Dendrogram")
         p = 40
@@ -234,8 +234,8 @@ with tab1:
         for n, c in enumerate(panel):
             r, k = n // kolom + 1, n % kolom + 1
             anggota = Z[label == c]
-            xs = np.tile(np.r_[x, np.nan], len(anggota))
-            ys = np.c_[anggota, np.full(len(anggota), np.nan)].ravel()
+            xs = np.tile(np.r_[x, np.nan], len(anggota)).astype(np.float32)  # float32: separuh ukuran data ke browser
+            ys = np.c_[anggota, np.full(len(anggota), np.nan)].ravel().astype(np.float32)
             fig.add_trace(go.Scattergl(x=xs, y=ys, mode="lines", line=dict(color="rgba(120,120,115,0.09)", width=1),
                                        hoverinfo="skip", showlegend=False), r, k)
             pusat = centroid[label_mentah[label == c][0]] if centroid is not None and c > 0 else anggota.mean(0)
@@ -288,13 +288,13 @@ with tab1:
                     f"{angka(abs(p['Median change H2 vs H1 (%)']), 1)}% (median) dibanding H1.")
 
 # ---------- tab 2: validasi ----------
-with tab2:
+if tampilan == TAMPILAN[1]:
     if metode in an.PAKAI_K:
         lambat = metode.startswith("K-Means")
         hitung = st.checkbox("Hitung silhouette untuk K = 2 sampai 6" + (" (± 2 menit untuk K-Means)" if lambat else ""), value=not lambat)
         if hitung:
             with st.spinner("Menghitung silhouette untuk K = 2 sampai 6…"):
-                skor = skor_k(D, Z, kunci, metode, param)
+                skor = skor_k(D, Z, kunci, metode, {k: v for k, v in param.items() if k != "k"})
             ka, kb = st.columns(2)
             f = go.Figure(go.Scatter(x=skor.K, y=skor.silhouette, mode="lines+markers", line=dict(color=WARNA[0], width=2),
                                      marker=dict(size=9), hovertemplate="K = %{x}<br>Silhouette %{y:.3f}<extra></extra>"))
@@ -413,7 +413,7 @@ with tab2:
                 "DBA menghitung centroid dari pasangan minggu hasil DTW, sehingga K-Means tetap sah dipakai bersama DTW.")
 
 # ---------- tab 3: zero handling ----------
-with tab3:
+if tampilan == TAMPILAN[2]:
     X = df[an.MINGGU].values
     ringkas = seg.assign(unit=X.mean(1)).groupby("segmen").agg(Produk=("Product_Code", "size"), **{"Unit/minggu": ("unit", "mean"),
                                                                 "Minggu bernilai 0": ("minggu_nol", "mean")}).round(2)
@@ -444,15 +444,14 @@ with tab3:
         grafik(fig)
 
     urut = np.lexsort(((X == 0).sum(1), seg.nol_awal.values))
-    fig = go.Figure(go.Heatmap(z=(X[urut] > 0).astype(int), colorscale=[[0, "#ffffff"], [1, "#256abf"]], showscale=False,
-                               customdata=np.repeat(seg.Product_Code.values[urut][:, None], 52, 1),
-                               hovertemplate="%{customdata} · minggu %{x}<br>%{z:.0f} = terjual<extra></extra>"))
+    fig = go.Figure(go.Heatmap(z=(X[urut] > 0).astype(int), y=seg.Product_Code.values[urut], colorscale=[[0, "#ffffff"], [1, "#256abf"]],
+                               showscale=False, hovertemplate="%{y} · minggu %{x}<br>%{z:.0f} = terjual<extra></extra>"))
     tata(fig, 420, title=dict(text="Sales presence map: biru = terjual, putih = 0 (diurutkan menurut minggu penjualan pertama)", font=dict(size=14)))
     fig.update_xaxes(title_text="Minggu ke-"); fig.update_yaxes(showticklabels=False, title_text="Produk", autorange="reversed")
     grafik(fig)
 
 # ---------- tab 4: DTW explorer ----------
-with tab4:
+if tampilan == TAMPILAN[3]:
     catatan("DTW mencocokkan minggu secara fleksibel (time warping) agar pola yang sama tetapi bergeser tetap terbaca mirip. "
             "Sakoe-Chiba band membatasi time shift paling jauh r minggu.")
     pilihan_produk = list(kode)
@@ -494,7 +493,7 @@ with tab4:
             f"Band r = {radius} menahan time shift itu, sehingga jaraknya berada di antara Euclidean dan DTW unconstrained.")
 
 # ---------- tab 5: tabel ----------
-with tab5:
+if tampilan == TAMPILAN[4]:
     hasil = seg[["Product_Code", "ADI", "CV2", "pola", "segmen"]].rename(columns={"pola": "demand_pattern", "segmen": "segment"})
     hasil["cluster"] = ""
     hasil.loc[reg, "cluster"] = [nama(c) for c in label]
@@ -506,7 +505,7 @@ with tab5:
     st.download_button("Unduh label (CSV)", hasil.to_csv(index=False).encode("utf-8"), file_name=nama_file, mime="text/csv")
 
 # ---------- tab 6: glossary ----------
-with tab6:
+if tampilan == TAMPILAN[5]:
     istilah = [
         ("DTW (Dynamic Time Warping)", "Jarak antar dua time series yang boleh menggeser waktu agar pola yang sama tetapi terlambat/lebih cepat tetap dinilai mirip."),
         ("Sakoe-Chiba band", "Batas time shift maksimum (r minggu) pada DTW, mencegah pathological warping."),
